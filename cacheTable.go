@@ -2,6 +2,7 @@ package go2cache
 
 import (
 	"log"
+	"sort"
 	"sync"
 	"time"
 )
@@ -181,4 +182,82 @@ func (table *CacheTable) Exists(key interface{}) bool {
 	defer table.RUnlock()
 	_, ok := table.items[key]
 	return ok
+}
+func (table *CacheTable) NotFoundAdd(key interface{}, lifeSpan time.Duration, data interface{}) bool {
+	table.Lock()
+	if _, ok := table.items[key]; ok {
+		table.Unlock()
+		return false
+	}
+	item := NewCacheItem(key, lifeSpan, data)
+	table.addInternal(item)
+	return true
+}
+func (table *CacheTable) Value(key interface{}, args ...interface{}) (*CacheItem, error) {
+	table.RLock()
+	r, ok := table.items[key]
+	loadData := table.loadData
+	table.RUnlock()
+	if ok {
+		r.KeepAlive()
+		return r, nil
+	}
+	if loadData != nil {
+		item := loadData(key, args)
+		if item != nil {
+			table.Add(key, item.lifeSpan, item.data)
+			return item, nil
+		}
+		return nil, ErrKeyNotFoundOrLoadable
+	}
+	return nil, ErrKeyNotFound
+}
+func (table *CacheTable) Flush() { //清空表中所有的缓存项
+	table.Lock()
+	defer table.Unlock()
+	table.log("清空表:", table.name)
+	table.items = make(map[interface{}]*CacheItem)
+	table.cleanupInterval = 0
+	if table.cleanupTimer != nil {
+		table.cleanupTimer.Stop()
+	}
+
+}
+
+type CacheItemPair struct {
+	Key         interface{}
+	AccessCount int64
+}
+type CacheItemPairList []CacheItemPair
+
+func (p CacheItemPairList) Swap(i, j int)      { p[i], p[j] = p[j], p[i] } //继承sort类内部方法
+func (p CacheItemPairList) Len() int           { return len(p) }
+func (p CacheItemPairList) Less(i, j int) bool { return p[i].AccessCount > p[j].AccessCount }
+func (table *CacheTable) MostAccessed(count int64) []*CacheItem { //寻找hit数大于count的key
+	table.RLock()
+	defer table.RUnlock()
+
+	p := make(CacheItemPairList, len(table.items))
+	i := 0
+	for k, v := range table.items {
+		p[i] = CacheItemPair{k, v.accessCount}
+		i++
+	}
+	sort.Sort(p)
+
+	var r []*CacheItem
+	c := int64(0)
+	for _, v := range p {
+		if c >= count {
+			break
+		}
+
+		item, ok := table.items[v.Key]
+		if ok {
+			r = append(r, item)
+		}
+		c++
+	}
+
+	return r
 }
